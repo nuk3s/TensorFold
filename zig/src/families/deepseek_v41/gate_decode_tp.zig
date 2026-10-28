@@ -110,7 +110,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     var runner: run.Runner = .{ .gpa = gpa, .d = &driver, .stream = stream, .kernels = &kernels, .triton = &aot, .weights = &w };
     defer runner.deinit();
     // TF_DSV41_PROFILE=<file>: every eager decode window's calls timed (profile.zig), written at the end
-    runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &driver)) |p| p.timer() else null;
+    runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &driver, rank, world)) |p| p.timer() else null;
     defer if (runner.prof) |p| p.close(io);
     // TF_DSV41_DECODE_TP_TOPP (the reference's TF_DSV41_EXPERT_TOPP): unset = no top-p prune, else prune at that mass
     const topp: ?f64 = if (std.c.getenv("TF_DSV41_DECODE_TP_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;

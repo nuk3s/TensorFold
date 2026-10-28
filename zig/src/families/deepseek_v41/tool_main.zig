@@ -39,6 +39,8 @@ const usage =
     \\       tf-dsv41 forward-digests PACK REF OUT (our forward vs recipe/dsv41_forward_digests.py's run, one GPU)
     \\       tf-dsv41 decode-tp PACK REF OUT (one NCCL rank, against matching-world reference tokens and digests)
     \\       tf-dsv41 follow PACK ASSETS (a served model's rank > 0: rank 0's forward operations until it stops)
+    \\       tf-dsv41 exchanges PROFILE... (host only: every rank's TF_DSV41_PROFILE file side by side: who arrived
+    \\                   last at each prefill exchange, how long the other ranks waited, and the transfer)
     \\       tf-dsv41 generate PACK ASSETS TRACE (rank 0: TRACE's prompts through the served engine, ids == recorded)
     \\       tf-dsv41 slot-drafts PACK ASSETS TRACE... (rank 0: drafts over several live slots, batched == alone == recorded)
     \\  PACK     the EXL3 pack (config.json, index, shards)
@@ -76,6 +78,18 @@ pub fn main(init: std.process.Init) !u8 {
         var out = std.Io.File.stdout().writer(init.io, &buf);
         check.planAll(init.gpa, @embedFile("fixtures/dense-k2.txt"), @embedFile("fixtures/expert-k2.txt"), &out.interface) catch |e| {
             std.debug.print("FAIL tf-dsv41 plan: {t}\n", .{e});
+            return 1;
+        };
+        out.interface.flush() catch {};
+        return 0;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "exchanges")) {
+        const paths = try init.arena.allocator().alloc([]const u8, args.len - 2);
+        for (paths, args[2..]) |*t, x| t.* = x;
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        @import("xprof_merge.zig").main(init.gpa, init.io, paths, &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41 exchanges: {t}\n", .{e});
             return 1;
         };
         out.interface.flush() catch {};

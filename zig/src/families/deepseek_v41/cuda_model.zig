@@ -312,7 +312,7 @@ pub const Model = struct {
         m.widths = try gate_forward.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
         // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed, JSON written at close
-        m.runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &m.driver)) |p| p.timer() else null;
+        m.runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &m.driver, m.tcfg.rank, world)) |p| p.timer() else null;
         const topp: ?f64 = if (std.c.getenv("TF_DSV41_EXPERT_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
         // TF_DSV41_R1=1, or the eight separate R1 knobs (the knob reader's r1)
         const r1 = @import("serve_knobs.zig").r1(&@import("serve_knobs.zig").env);

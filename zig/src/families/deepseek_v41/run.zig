@@ -18,6 +18,7 @@ pub const Timer = struct {
         begin: *const fn (ptr: *anyopaque) void,
         beginPrefill: *const fn (ptr: *anyopaque) void,
         prefillRows: *const fn (ptr: *anyopaque, rows: u64, tail: bool) void,
+        prompt: *const fn (ptr: *anyopaque) void,
         before: *const fn (ptr: *anyopaque, s: cuda.Stream, c: *const calls.Call) anyerror!void,
         after: *const fn (ptr: *anyopaque, s: cuda.Stream) anyerror!void,
         end: *const fn (ptr: *anyopaque, s: cuda.Stream) anyerror!void,
@@ -32,6 +33,10 @@ pub const Timer = struct {
     }
     pub fn prefillRows(t: Timer, rows: u64, tail: bool) void {
         t.vtable.prefillRows(t.ptr, rows, tail);
+    }
+    /// A prompt's prefill call starts (every rank): the prefill windows until the next one are its segments.
+    pub fn prompt(t: Timer) void {
+        t.vtable.prompt(t.ptr);
     }
     pub fn before(t: Timer, s: cuda.Stream, c: *const calls.Call) !void {
         return t.vtable.before(t.ptr, s, c);

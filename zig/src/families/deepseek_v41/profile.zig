@@ -4,14 +4,15 @@ const std = @import("std");
 const cuda = @import("cuda");
 const calls = @import("block_calls.zig");
 const run = @import("run.zig");
+const xprof = @import("xprof.zig");
 
 pub const Profile = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
     path: []const u8,
     events: std.ArrayList(cuda.Event) = .empty,
-    /// this window's calls: name and the index of its start event
-    open: std.ArrayList(struct { name: []const u8, at: usize }) = .empty,
+    /// this window's calls: name, start event, exchange kind and bytes, and whether the call begins a layer
+    open: std.ArrayList(struct { name: []const u8, at: usize, ex: xprof.Kind = .none, bytes: u64 = 0, layer: bool = false }) = .empty,
     used: usize = 0,
     totals: std.StringArrayHashMapUnmanaged(Total) = .empty,
     windows: u64 = 0,
@@ -21,6 +22,11 @@ pub const Profile = struct {
     /// the open window is a prefill segment (beginPrefill): its times go to `pf`
     prefill: bool = false,
     pf: Totals = .{},
+    /// each prefill segment's exchanges, from the same events (xprof.zig; every rank writes its own)
+    x: xprof.Rank = .{},
+    /// host clock at the last prefill window's end, and the open window's boundary (Rank.boundary_ns)
+    pf_end: u64 = 0,
+    bound: u64 = 0,
 
     pub const Totals = struct {
         calls: std.StringArrayHashMapUnmanaged(Total) = .empty,
@@ -55,6 +61,11 @@ pub const Profile = struct {
                 self(ptr).prefillRows(rows, tail);
             }
         }.f,
+        .prompt = struct {
+            fn f(ptr: *anyopaque) void {
+                self(ptr).x.prompt();
+            }
+        }.f,
         .before = struct {
             fn f(ptr: *anyopaque, s: cuda.Stream, c: *const calls.Call) anyerror!void {
                 return self(ptr).before(s, c);
@@ -81,10 +92,10 @@ pub const Profile = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    pub fn fromEnv(gpa: std.mem.Allocator, d: *const cuda.Driver) !?*Profile {
+    pub fn fromEnv(gpa: std.mem.Allocator, d: *const cuda.Driver, rank: u32, world: u32) !?*Profile {
         const p = std.c.getenv("TF_DSV41_PROFILE") orelse return null;
         const x = try gpa.create(Profile);
-        x.* = .{ .gpa = gpa, .d = d, .path = std.mem.span(p) };
+        x.* = .{ .gpa = gpa, .d = d, .path = std.mem.span(p), .x = .{ .rank = rank, .world = world } };
         return x;
     }
 
@@ -105,18 +116,21 @@ pub const Profile = struct {
     pub fn beginPrefill(p: *Profile) void {
         p.begin();
         p.prefill = true;
+        p.bound = if (p.x.fresh or p.pf_end == 0) 0 else p.t0 -| p.pf_end;
     }
 
     /// The rows the last prefill window covered (`tail`: a CED decoder replay's).
     pub fn prefillRows(p: *Profile, rows: u64, tail: bool) void {
         if (tail) p.pf.tail_rows += rows else p.pf.rows += rows;
+        p.x.rows(rows, tail);
     }
 
     /// Before a call: its start event on the stream.
     pub fn before(p: *Profile, s: cuda.Stream, c: *const calls.Call) !void {
         const at = p.used;
         try (try p.event()).record(s);
-        try p.open.append(p.gpa, .{ .name = c.name, .at = at });
+        const ex = xprof.kindOf(c);
+        try p.open.append(p.gpa, .{ .name = c.name, .at = at, .ex = ex, .bytes = if (ex == .timed) xprof.bytesOf(c) else 0, .layer = c.begin == .layer });
     }
 
     /// After a call: its end event.
@@ -132,13 +146,14 @@ pub const Profile = struct {
         if (p.prefill) {
             p.pf.wall_ns += wall;
             p.pf.windows += 1;
+            try p.x.segment(p.gpa, p.bound);
+            try p.exchanges();
         } else {
             p.wall_ns += wall;
             p.windows += 1;
         }
         for (p.open.items) |o| {
-            const ms = try p.events.items[o.at].elapsedMs(p.events.items[o.at + 1]);
-            const ns: u64 = @intFromFloat(@max(0.0, ms) * 1e6);
+            const ns = try p.between(o.at, o.at + 1);
             const g = try map.getOrPut(p.gpa, o.name);
             if (!g.found_existing) {
                 g.key_ptr.* = try p.gpa.dupe(u8, o.name);
@@ -148,7 +163,40 @@ pub const Profile = struct {
             g.value_ptr.ns += ns;
             if (p.prefill) p.pf.gpu_ns += ns else p.gpu_ns += ns;
         }
+        if (p.prefill) p.pf_end = nowNs();
         p.prefill = false;
+    }
+
+    /// The prefill window's timed exchanges: in, gap, the gap's idle between calls, layer and site (xprof.zig).
+    fn exchanges(p: *Profile) !void {
+        // the event the next exchange's gap starts from: the last timed exchange's end, else the window's first
+        var from: usize = 0;
+        var idle: u64 = 0;
+        var layer: u32 = 0;
+        var site: u32 = 0;
+        for (p.open.items, 0..) |o, i| {
+            if (i > 0) idle += try p.between(p.open.items[i - 1].at + 1, o.at);
+            if (o.layer) {
+                layer += 1;
+                site = 0;
+            }
+            switch (o.ex) {
+                .timed => {
+                    try p.x.exchange(p.gpa, .{ .in_ns = try p.between(o.at, o.at + 1), .gap_ns = try p.between(from, o.at), .idle_ns = idle, .bytes = o.bytes, .layer = layer, .site = site });
+                    from = o.at + 1;
+                    idle = 0;
+                    site += 1;
+                },
+                .untimed => p.x.skip(),
+                .none => {},
+            }
+        }
+    }
+
+    /// GPU time from event `a` to event `b` of this window.
+    fn between(p: *const Profile, a: usize, b: usize) !u64 {
+        const ms = try p.events.items[a].elapsedMs(p.events.items[b]);
+        return @intFromFloat(@max(0.0, ms) * 1e6);
     }
 
     /// Writes the totals (JSON) and frees everything.
@@ -159,7 +207,9 @@ pub const Profile = struct {
         for (p.totals.keys(), p.totals.values(), 0..) |k, v, i| w.writer.print("{s}\"{s}\": {{\"calls\": {d}, \"ms\": {d:.4}}}", .{ if (i == 0) "" else ", ", k, v.calls, @as(f64, @floatFromInt(v.ns)) / 1e6 }) catch {};
         w.writer.print("}}, \"prefill\": {{\"segments\": {d}, \"rows\": {d}, \"tail_rows\": {d}, \"wall_ms\": {d:.3}, \"gpu_ms\": {d:.3}, \"calls\": {{", .{ p.pf.windows, p.pf.rows, p.pf.tail_rows, @as(f64, @floatFromInt(p.pf.wall_ns)) / 1e6, @as(f64, @floatFromInt(p.pf.gpu_ns)) / 1e6 }) catch {};
         for (p.pf.calls.keys(), p.pf.calls.values(), 0..) |k, v, i| w.writer.print("{s}\"{s}\": {{\"calls\": {d}, \"ms\": {d:.4}}}", .{ if (i == 0) "" else ", ", k, v.calls, @as(f64, @floatFromInt(v.ns)) / 1e6 }) catch {};
-        w.writer.print("}}}}}}\n", .{}) catch {};
+        w.writer.writeAll("}, \"exchanges\": ") catch {};
+        p.x.write(&w.writer) catch {};
+        w.writer.writeAll("}}\n") catch {};
         if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.path, .data = w.written() })) |_| {
             std.log.info("profile: {s} written ({d} windows, {d} prefill segments)", .{ p.path, p.windows, p.pf.windows });
         } else |e| std.log.err("profile: {s} not written ({t})", .{ p.path, e });
@@ -170,6 +220,7 @@ pub const Profile = struct {
         p.totals.deinit(p.gpa);
         for (p.pf.calls.keys()) |k| p.gpa.free(k);
         p.pf.calls.deinit(p.gpa);
+        p.x.deinit(p.gpa);
         p.gpa.destroy(p);
     }
 };

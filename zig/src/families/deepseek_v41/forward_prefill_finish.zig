@@ -48,6 +48,7 @@ pub fn promptMulti(f: *Forward, segs: []const MultiSeg) !void {
     if (image_opts.segmentOptions(f, all.items).image_rows != 0) return error.Unsupported;
     const cs = try block_prefill.emitMulti(a, f.cfg, f.widths, f.opts, layers, spans, if (replay) .encoder else .whole);
     try ready(f);
+    if (f.runner.prof) |pr| pr.prompt();
     // the pages of every segment's positions, before any launch (each on its slot's table)
     for (segs) |sg| {
         try sw.run(sw.ctx, sg.slot);

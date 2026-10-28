@@ -287,6 +287,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     }
     const ids = st.ids.items;
     st.taps_rows = 0;
+    if (f.runner.prof) |pr| pr.prompt();
     try ready(f);
     // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
     st.ws_ok = true;
